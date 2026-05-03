@@ -1,0 +1,34 @@
+TEAM PROJECT DATA FLOW AND LOGIC TRACE
+======================================
+This traces exactly how our data moves from the shell script, through the pipeline, to the final output.
+
+PHASE 1: ORCHESTRATION (run.sh & dispatcher.c)
+- User executes `./run.sh -n 4`. The script compiles all C files via Makefile.
+- Script launches `dispatcher`, saving its PID to handle Ctrl-C cleanups.
+- `dispatcher` creates the named pipe (FIFO) and POSIX shared memory.
+- `dispatcher` forks 3 child processes, redirects their terminal output to `logs/`, and transforms them into Ingester, Processor, and Reporter.
+
+PHASE 2: THE CYCLE TRACE (ingester.c -> processor.c)
+Imagine our CSV has these lines: "Temp_LivingRoom,22.1,22.2\nVolt_Main,120.1,120.0\n"
+
+Cycle 1: The First Cut
+1. The Ingester Cuts the Data: Reads first 35 chars. Text: "Temp_LivingRoom,22.1,22.2\nVolt_Main"
+2. The Ingester Creates Header: Fills ChunkHeader struct -> [ID: 1, Bytes: 35]
+3. The Ingester Pushes: Pushes Header into pipe, then the 35 bytes of text.
+4. The Processor Reads Header: Wakes up, reads exactly sizeof(ChunkHeader). Knows 35 bytes are coming.
+5. The Processor Reads Text: Reads exactly 35 bytes from the pipe.
+6. The Spillover Bucket Kicks In: 
+   - Searches text backwards for last newline '\n'. Finds it after 22.2.
+   - Packages complete row ("Temp_LivingRoom,22.1,22.2\n") and sends to worker queue.
+   - Takes fragmented piece ("Volt_Main") and saves it in the Spillover Bucket.
+
+Cycle 2: The Stitch
+7. The Ingester Cuts Remaining: Reads last 14 chars. Text: ",120.1,120.0\n"
+8. The Ingester Creates Header: [ID: 2, Bytes: 14]
+9. The Ingester Pushes: Pushes Header, then 14 chars.
+10. The Processor Reads Header: Expects 14 bytes next.
+11. The Processor Reads Text: Reads exactly 14 bytes without touching garbage memory.
+12. The Spillover Bucket Stitches It:
+    - Processor checks bucket, finds "Volt_Main".
+    - Glues it to new text: "Volt_Main" + ",120.1,120.0\n" = "Volt_Main,120.1,120.0\n"
+    - Row is whole again. Finds '\n', sends perfect row to queue, empties bucket.
